@@ -17,10 +17,19 @@ from .metrics import REQUEST_COUNT, REQUEST_LATENCY
 from .schemas import (
     TransferCreateRequest,
     TransferResponse,
+    TransferReverseRequest,
     WalletCreateRequest,
     WalletResponse,
 )
-from .transfers import IdempotencyConflict, create_transfer, get_transfer
+from .transfers import (
+    AlreadyReversed,
+    IdempotencyConflict,
+    TransferNotFound,
+    TransferNotReversible,
+    create_transfer,
+    get_transfer,
+    reverse_transfer,
+)
 from .wallets import get_or_create_wallet, get_wallet
 
 configure_logging()
@@ -94,7 +103,18 @@ def _transfer_response(transfer) -> TransferResponse:
         decline_reason=transfer.decline_reason,
         created_at=transfer.created_at,
         completed_at=transfer.completed_at,
+        reversal_of=transfer.reversal_of_transfer_id,
     )
+
+
+def _authorize_transfer_party(transfer, token_hash: str):
+    from_wallet = get_wallet(engine, transfer.from_wallet_id)
+    to_wallet = get_wallet(engine, transfer.to_wallet_id)
+    owner_hashes = {w.owner_token_hash for w in (from_wallet, to_wallet) if w is not None}
+    if token_hash not in owner_hashes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized for this transfer"
+        )
 
 
 @app.get("/health")
@@ -174,12 +194,47 @@ def read_transfer(transfer_id: str, token_hash: str = Depends(get_caller_token_h
     if transfer is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transfer not found")
 
-    from_wallet = get_wallet(engine, transfer.from_wallet_id)
-    to_wallet = get_wallet(engine, transfer.to_wallet_id)
-    owner_hashes = {w.owner_token_hash for w in (from_wallet, to_wallet) if w is not None}
-    if token_hash not in owner_hashes:
+    _authorize_transfer_party(transfer, token_hash)
+    return _transfer_response(transfer)
+
+
+@app.post(
+    "/transfers/{transfer_id}/reverse",
+    response_model=TransferResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def reverse_transfer_endpoint(
+    transfer_id: str,
+    payload: TransferReverseRequest,
+    response: Response,
+    token_hash: str = Depends(get_caller_token_hash),
+):
+    original = get_transfer(engine, transfer_id)
+    if original is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transfer not found")
+    _authorize_transfer_party(original, token_hash)
+
+    try:
+        result, _original, is_replay = reverse_transfer(engine, payload.idempotency_key, transfer_id)
+    except TransferNotFound:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transfer not found")
+    except TransferNotReversible as exc:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to view this transfer"
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"cannot reverse a transfer with status '{exc.original.status}'",
+        )
+    except AlreadyReversed:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="transfer has already been reversed",
+        )
+    except IdempotencyConflict:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="idempotency_key already used with a different request body",
         )
 
-    return _transfer_response(transfer)
+    if is_replay:
+        response.status_code = status.HTTP_200_OK
+        response.headers["Idempotent-Replay"] = "true"
+    return _transfer_response(result)

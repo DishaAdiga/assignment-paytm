@@ -44,6 +44,13 @@ def post_transfer(base_url, token, from_id, to_id, amount, idem_key):
     return requests.post(f"{base_url}/transfers", json=body, headers=auth_headers(token), timeout=30)
 
 
+def post_reverse(base_url, token, transfer_id, idem_key):
+    body = {"idempotency_key": idem_key}
+    return requests.post(
+        f"{base_url}/transfers/{transfer_id}/reverse", json=body, headers=auth_headers(token), timeout=30
+    )
+
+
 def scenario_concurrent_get_or_create(base_url, n=20):
     print(f"\n[1] Concurrent get-or-create: {n} simultaneous POST /wallets for a brand-new user")
     token = new_token()
@@ -123,11 +130,55 @@ def scenario_conservation_under_contention(base_url, n_wallets=4, n_transfers=10
         sys.exit(1)
 
 
+def scenario_reversal_storm(base_url, k=20):
+    print(f"\n[4] Reversal idempotency storm: reverse the same transfer {k} times concurrently")
+    token_a, token_b = new_token(), new_token()
+    starting_balance = 100_000
+    amount = 10_000
+    wallet_a = create_wallet(base_url, token_a, initial_balance_paise=starting_balance)
+    wallet_b = create_wallet(base_url, token_b, initial_balance_paise=0)
+    total_before = starting_balance
+
+    r = post_transfer(base_url, token_a, wallet_a["id"], wallet_b["id"], amount, uuid.uuid4().hex)
+    r.raise_for_status()
+    transfer = r.json()
+    assert transfer["status"] == "completed", transfer
+
+    idem_key = uuid.uuid4().hex
+    with concurrent.futures.ThreadPoolExecutor(max_workers=k) as pool:
+        futures = [
+            pool.submit(post_reverse, base_url, token_a, transfer["id"], idem_key) for _ in range(k)
+        ]
+        responses = [f.result() for f in futures]
+
+    ok_status = all(r.status_code in (200, 201) for r in responses)
+    bodies = [r.json() for r in responses]
+    reversal_ids = {b["id"] for b in bodies}
+    ok = ok_status and len(reversal_ids) == 1
+    print(f"    all requests succeeded: {ok_status}, distinct reversal ids: {len(reversal_ids)} -> {'PASS' if ok else 'FAIL'}")
+
+    balance_a = get_wallet(base_url, token_a, wallet_a["id"])["balance_paise"]
+    balance_b = get_wallet(base_url, token_b, wallet_b["id"])["balance_paise"]
+    conserved = balance_a + balance_b == total_before
+    refunded = balance_a == starting_balance and balance_b == 0
+    print(f"    balance_a={balance_a}, balance_b={balance_b}, conserved={conserved}, fully refunded={refunded} -> {'PASS' if conserved and refunded else 'FAIL'}")
+
+    # Reversing again (fresh idempotency key) must be rejected, not double-refund.
+    r2 = post_reverse(base_url, token_a, transfer["id"], uuid.uuid4().hex)
+    second_reverse_rejected = r2.status_code == 409
+    print(f"    second reverse (new key) rejected with 409: {second_reverse_rejected} -> {'PASS' if second_reverse_rejected else 'FAIL'}")
+
+    if not (ok and conserved and refunded and second_reverse_rejected):
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument(
-        "--scenario", default="all", choices=["all", "get_or_create", "idempotent", "conservation"]
+        "--scenario",
+        default="all",
+        choices=["all", "get_or_create", "idempotent", "conservation", "reversal"],
     )
     parser.add_argument("--n", type=int, default=20, help="concurrency for each scenario")
     args = parser.parse_args()
@@ -139,6 +190,8 @@ def main():
         scenario_idempotent_retry_storm(base_url, k=args.n)
     if args.scenario in ("all", "conservation"):
         scenario_conservation_under_contention(base_url, n_transfers=max(args.n * 5, 100))
+    if args.scenario in ("all", "reversal"):
+        scenario_reversal_storm(base_url, k=args.n)
 
     print("\nAll scenarios PASSED")
 

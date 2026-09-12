@@ -164,6 +164,15 @@
         <button onclick="getTransfer()">Get Transfer Status</button>
       </div>
       <pre class="result" id="transferStatusResult">—</pre>
+      <label for="reverseIdemKey">Reversal idempotency key</label>
+      <div class="row">
+        <div><input id="reverseIdemKey" placeholder="e.g. reverse-order-42" /></div>
+        <div style="flex: 0 0 auto;"><button class="secondary" onclick="generateReverseKey()">Generate</button></div>
+      </div>
+      <small class="hint">Reverses the transfer above (moves the amount back to the original sender). Re-submitting the same key replays the same result; a fresh key on an already-reversed transfer returns 409.</small>
+      <div class="btn-row">
+        <button onclick="reverseTransfer()">Reverse Transfer</button>
+      </div>
     </div>
 
     <div class="card full">
@@ -286,6 +295,18 @@ async function getTransfer() {
   const id = $('transferIdLookup').value.trim();
   if (!id) return alert('Enter a transfer id first');
   const { body } = await api(`/transfers/${id}`, 'GET');
+  $('transferStatusResult').textContent = JSON.stringify(body, null, 2);
+}
+
+function generateReverseKey() {
+  $('reverseIdemKey').value = crypto.randomUUID();
+}
+
+async function reverseTransfer() {
+  const id = $('transferIdLookup').value.trim();
+  const idempotency_key = $('reverseIdemKey').value.trim();
+  if (!id || !idempotency_key) return alert('Enter a transfer id and a reversal idempotency key first');
+  const { body } = await api(`/transfers/${id}/reverse`, 'POST', { idempotency_key });
   $('transferStatusResult').textContent = JSON.stringify(body, null, 2);
 }
 </script>

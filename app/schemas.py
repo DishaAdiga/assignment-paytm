@@ -40,6 +40,10 @@ class TransferCreateRequest(BaseModel):
         return _ensure_paise_int(v)
 
 
+class TransferReverseRequest(BaseModel):
+    idempotency_key: str = Field(min_length=1, max_length=255)
+
+
 class TransferResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -51,3 +55,4 @@ class TransferResponse(BaseModel):
     decline_reason: Optional[str] = None
     created_at: datetime
     completed_at: Optional[datetime] = None
+    reversal_of: Optional[str] = None

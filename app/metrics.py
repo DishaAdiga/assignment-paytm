@@ -16,3 +16,12 @@ IDEMPOTENT_REPLAYS = Counter("idempotent_replays_total", "Idempotency key replay
 IDEMPOTENCY_CONFLICTS = Counter(
     "idempotency_conflicts_total", "Same idempotency key reused with a different request body"
 )
+
+REVERSALS_CREATED = Counter("reversals_created_total", "Reversals that completed successfully")
+REVERSALS_DECLINED = Counter(
+    "reversals_declined_insufficient_funds_total", "Reversals declined for insufficient funds"
+)
+REVERSAL_REPLAYS = Counter("reversal_replays_total", "Reversal idempotency key replay hits")
+REVERSAL_CONFLICTS = Counter(
+    "reversal_conflicts_total", "Reversal attempt rejected: already reversed or key conflict"
+)

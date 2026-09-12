@@ -127,6 +127,31 @@ curl -s -X POST http://localhost:8000/transfers \
 curl -s http://localhost:8000/transfers/<id> -H "Authorization: Bearer alice"
 ```
 
+### `POST /transfers/{id}/reverse` — refund a completed transfer
+
+Moves the transfer's exact amount back from recipient to sender. Visible to
+either party of the original transfer. Reuses the same sorted-lock +
+lock-protected-balance-check primitive as `POST /transfers`, with roles
+swapped, so it inherits the same conservation/no-overdraft guarantees.
+
+```bash
+curl -s -X POST http://localhost:8000/transfers/<id>/reverse \
+  -H "Authorization: Bearer alice" \
+  -H "Content-Type: application/json" \
+  -d '{"idempotency_key": "reverse-order-42"}'
+```
+
+- `201` new reversal processed (`status`: `completed` or `declined`).
+- `200` + `Idempotent-Replay: true` — retry of the same reversal key, same
+  result returned unchanged.
+- `409` — the transfer isn't `completed` (nothing to reverse), or it has
+  already been reversed (via a `UNIQUE` constraint on
+  `reversal_of_transfer_id`, so at most one reversal per transfer ever
+  exists regardless of which idempotency key is used), or the same
+  reversal key was reused with a different body.
+- A `declined`/`insufficient_funds` result (not an error) if the recipient
+  no longer has the funds to refund.
+
 ### `GET /metrics` — Prometheus exposition format
 
 ### `GET /health` — liveness/health check (used by the Docker `HEALTHCHECK`)
@@ -150,6 +175,10 @@ Runs, against any deployed URL:
 3. **Conservation under contention** — many concurrent transfers over a
    small set of wallets (including opposite-direction pairs at once),
    asserts total balance is unchanged and no balance went negative.
+4. **Reversal storm** — reverses the same completed transfer K times
+   concurrently, asserts exactly one reversal is applied, the funds are
+   fully back, and reversing it again afterwards (with a new idempotency
+   key) is cleanly rejected with `409` instead of double-refunding.
 
 Each scenario exits non-zero on failure so it can be used as a CI gate.
 

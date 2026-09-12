@@ -1,6 +1,6 @@
 import os
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 from .models import metadata
 
@@ -30,3 +30,28 @@ engine = create_engine(
 
 def init_db() -> None:
     metadata.create_all(engine)
+    _migrate_reversal_column()
+
+
+def _migrate_reversal_column() -> None:
+    """In-place migration for DBs created before reversals existed.
+
+    create_all() only creates missing tables, it never alters existing
+    ones, so a table from an older deploy needs this column/constraint
+    added by hand. Safe to run on every startup.
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE transfers ADD COLUMN IF NOT EXISTS "
+                "reversal_of_transfer_id VARCHAR(36) REFERENCES transfers(id)"
+            )
+        )
+        conn.execute(
+            text(
+                "DO $$ BEGIN "
+                "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_transfers_reversal_of') THEN "
+                "ALTER TABLE transfers ADD CONSTRAINT uq_transfers_reversal_of UNIQUE (reversal_of_transfer_id); "
+                "END IF; END $$;"
+            )
+        )

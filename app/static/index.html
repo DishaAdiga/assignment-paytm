@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Wallet Service — Test Console</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --card: #161d2e;
+    --border: #263047;
+    --text: #e6e9f0;
+    --muted: #8b93a7;
+    --accent: #4f8cff;
+    --ok: #33c17a;
+    --err: #e5534b;
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+  .layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  .full { grid-column: 1 / -1; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .card h2 {
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 0 0 12px;
+  }
+  label {
+    display: block;
+    font-size: 12px;
+    color: var(--muted);
+    margin: 10px 0 4px;
+  }
+  input, select {
+    width: 100%;
+    padding: 8px 10px;
+    background: #0d1220;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+    font-family: "SFMono-Regular", Consolas, monospace;
+  }
+  .row { display: flex; gap: 8px; align-items: end; }
+  .row > div { flex: 1; }
+  button {
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 9px 14px;
+    font-size: 13px;
+    cursor: pointer;
+    margin-top: 10px;
+  }
+  button.secondary {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  button:hover { filter: brightness(1.1); }
+  button:active { transform: translateY(1px); }
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  pre.result {
+    background: #0a0e18;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    margin-top: 10px;
+    font-size: 12px;
+    max-height: 220px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .status-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-right: 6px;
+  }
+  .status-2xx { background: rgba(51,193,122,0.15); color: var(--ok); }
+  .status-4xx, .status-5xx { background: rgba(229,83,75,0.15); color: var(--err); }
+  #log {
+    background: #0a0e18;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    height: 260px;
+    overflow-y: auto;
+    font-size: 12px;
+    font-family: "SFMono-Regular", Consolas, monospace;
+  }
+  #log .entry { margin-bottom: 10px; border-bottom: 1px dashed var(--border); padding-bottom: 8px; }
+  #log .meta { color: var(--muted); }
+  small.hint { color: var(--muted); display: block; margin-top: 4px; font-size: 11px; }
+</style>
+</head>
+<body>
+  <h1>Wallet Service — Test Console</h1>
+  <p class="subtitle">A plain HTML/JS page for manually exercising the API. For the graded concurrency invariants, use <code>scripts/burst_test.py</code> instead.</p>
+
+  <div class="layout">
+    <div class="card full">
+      <h2>Connection</h2>
+      <div class="row">
+        <div>
+          <label for="baseUrl">Base URL</label>
+          <input id="baseUrl" placeholder="http://localhost:8000" />
+        </div>
+        <div>
+          <label for="token">Bearer token (this is your user identity)</label>
+          <input id="token" placeholder="e.g. alice" />
+        </div>
+      </div>
+      <small class="hint">Values are remembered in this browser via localStorage. Switch the token to act as a different user.</small>
+    </div>
+
+    <div class="card">
+      <h2>Wallet</h2>
+      <label for="initialBalance">Initial balance (paise, first creation only)</label>
+      <input id="initialBalance" type="number" value="0" min="0" />
+      <div class="btn-row">
+        <button onclick="createWallet()">Get / Create Wallet</button>
+      </div>
+      <label for="walletId">Wallet id</label>
+      <input id="walletId" placeholder="wallet id" />
+      <div class="btn-row">
+        <button class="secondary" onclick="getWalletBalance()">Check Balance</button>
+        <button class="secondary" onclick="copyTo('transferFrom')">Use as From</button>
+        <button class="secondary" onclick="copyTo('transferTo')">Use as To</button>
+      </div>
+      <pre class="result" id="walletResult">—</pre>
+    </div>
+
+    <div class="card">
+      <h2>Transfer status</h2>
+      <label for="transferIdLookup">Transfer id</label>
+      <input id="transferIdLookup" placeholder="transfer id" />
+      <div class="btn-row">
+        <button onclick="getTransfer()">Get Transfer Status</button>
+      </div>
+      <pre class="result" id="transferStatusResult">—</pre>
+    </div>
+
+    <div class="card full">
+      <h2>Create transfer</h2>
+      <div class="row">
+        <div>
+          <label for="transferFrom">From wallet id</label>
+          <input id="transferFrom" placeholder="sender wallet id" />
+        </div>
+        <div>
+          <label for="transferTo">To wallet id</label>
+          <input id="transferTo" placeholder="receiver wallet id" />
+        </div>
+        <div>
+          <label for="amount">Amount (paise)</label>
+          <input id="amount" type="number" value="100" min="1" />
+        </div>
+      </div>
+      <label for="idemKey">Idempotency key</label>
+      <div class="row">
+        <div><input id="idemKey" placeholder="e.g. order-42" /></div>
+        <div style="flex: 0 0 auto;"><button class="secondary" onclick="generateKey()">Generate</button></div>
+      </div>
+      <small class="hint">Re-submitting the same from/to/amount/key replays the same result. Same key with a different body returns 409.</small>
+      <div class="btn-row">
+        <button onclick="createTransfer()">Submit Transfer</button>
+      </div>
+      <pre class="result" id="transferResult">—</pre>
+    </div>
+
+    <div class="card full">
+      <h2>Activity log</h2>
+      <div id="log"></div>
+    </div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function loadPersisted() {
+  $('baseUrl').value = localStorage.getItem('ws_base_url') || window.location.origin;
+  $('token').value = localStorage.getItem('ws_token') || 'alice';
+}
+function persist() {
+  localStorage.setItem('ws_base_url', $('baseUrl').value.trim());
+  localStorage.setItem('ws_token', $('token').value.trim());
+}
+loadPersisted();
+$('baseUrl').addEventListener('change', persist);
+$('token').addEventListener('change', persist);
+
+function generateKey() {
+  $('idemKey').value = crypto.randomUUID();
+}
+
+function copyTo(fieldId) {
+  const walletId = $('walletId').value.trim();
+  if (walletId) $(fieldId).value = walletId;
+}
+
+function logEntry(method, path, status, body) {
+  const el = document.createElement('div');
+  el.className = 'entry';
+  const pillClass = status >= 200 && status < 300 ? 'status-2xx' : (status >= 500 ? 'status-5xx' : 'status-4xx');
+  el.innerHTML = `<span class="status-pill ${pillClass}">${status}</span>` +
+    `<span class="meta">${new Date().toLocaleTimeString()} — ${method} ${path}</span>` +
+    `<pre style="margin:6px 0 0;">${escapeHtml(JSON.stringify(body, null, 2))}</pre>`;
+  const log = $('log');
+  log.prepend(el);
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+
+async function api(path, method = 'GET', body) {
+  persist();
+  const baseUrl = $('baseUrl').value.trim().replace(/\/+$/, '');
+  const token = $('token').value.trim();
+  const res = await fetch(baseUrl + path, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  let json;
+  try { json = await res.json(); } catch { json = { detail: 'no JSON body' }; }
+  logEntry(method, path, res.status, json);
+  return { status: res.status, body: json };
+}
+
+async function createWallet() {
+  const initial = parseInt($('initialBalance').value || '0', 10);
+  const { body } = await api('/wallets', 'POST', { initial_balance_paise: initial });
+  $('walletResult').textContent = JSON.stringify(body, null, 2);
+  if (body.id) $('walletId').value = body.id;
+}
+
+async function getWalletBalance() {
+  const id = $('walletId').value.trim();
+  if (!id) return alert('Enter a wallet id first');
+  const { body } = await api(`/wallets/${id}`, 'GET');
+  $('walletResult').textContent = JSON.stringify(body, null, 2);
+}
+
+async function createTransfer() {
+  const from = $('transferFrom').value.trim();
+  const to = $('transferTo').value.trim();
+  const amount = parseInt($('amount').value || '0', 10);
+  const idempotency_key = $('idemKey').value.trim();
+  if (!from || !to || !idempotency_key) return alert('from, to, and idempotency key are required');
+  const { body } = await api('/transfers', 'POST', { from, to, amount_paise: amount, idempotency_key });
+  $('transferResult').textContent = JSON.stringify(body, null, 2);
+  if (body.id) $('transferIdLookup').value = body.id;
+}
+
+async function getTransfer() {
+  const id = $('transferIdLookup').value.trim();
+  if (!id) return alert('Enter a transfer id first');
+  const { body } = await api(`/transfers/${id}`, 'GET');
+  $('transferStatusResult').textContent = JSON.stringify(body, null, 2);
+}
+</script>
+</body>
+</html>

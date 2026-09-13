@@ -102,9 +102,6 @@ def create_transfer(engine, idempotency_key: str, from_id: str, to_id: str, amou
         inserted = conn.execute(insert_stmt).fetchone()
 
         if inserted is None:
-            # Someone already used this (sender, key) pair. Postgres made us
-            # wait for that transaction to finish, so this read sees the
-            # final, committed outcome - never a half-applied transfer.
             existing = conn.execute(
                 select(transfers).where(
                     transfers.c.from_wallet_id == from_id,
@@ -220,9 +217,6 @@ def reverse_transfer(engine, idempotency_key: str, original_transfer_id: str):
                 request_hash=req_hash,
                 reversal_of_transfer_id=original_transfer_id,
             )
-            # No explicit conflict target: this catches either unique
-            # constraint (sender+key, or reversal_of_transfer_id), since
-            # only one reversal per original transfer is ever allowed.
             .on_conflict_do_nothing()
             .returning(transfers.c.id)
         )

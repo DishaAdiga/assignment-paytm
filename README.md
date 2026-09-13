@@ -34,48 +34,6 @@ A small, dependency-free HTML/JS console is served by the app itself at
 It's meant for quick manual poking, not for the concurrency invariants —
 use `scripts/burst_test.py` for those.
 
-## Testing with Postman
-
-A ready-made collection + environment are in [`postman/`](postman/):
-
-- `postman/wallet-service.postman_collection.json`
-- `postman/wallet-service.postman_environment.json`
-
-Import both in Postman, select the "Wallet Service - Local" environment
-(edit `base_url` if testing a deployed instance), then run requests in this
-order (the collection is organized to match):
-
-1. **Wallets → Create/Get Wallet A** and **Create/Get Wallet B** — each
-   saves the returned id into `wallet_a_id` / `wallet_b_id` via a test
-   script, so later requests can reference them automatically.
-2. **Wallets → Get Wallet A Balance** / **Get Wallet A - wrong owner** —
-   shows the balance read and the `403` you get from the wrong token.
-3. **Transfers → 1. Create Transfer (A -> B)** — generates a fresh
-   `idempotency_key` (via a pre-request script, using Postman's `{{$guid}}`
-   dynamic variable) the first time it's run, and saves the resulting
-   `transfer_id`.
-4. **Transfers → 2. Retry Same Transfer** — resends the exact same body and
-   key; asserts the response has the *same* `transfer_id` (idempotent
-   replay).
-5. **Transfers → 3. Replay With Different Body** — same key, different
-   `amount_paise`; asserts `409`.
-6. **Transfers → 4. Get Transfer Status** — reads it back by id.
-7. **Transfers → 5. Overdraft attempt** — a huge amount; asserts the
-   transfer is created but `status: "declined"` /
-   `decline_reason: "insufficient_funds"` (not an HTTP error).
-8. **Transfers → 6. Transfer from wallet you don't own** — asserts `403`.
-
-Each request has a `pm.test(...)` assertion, so you can also run the whole
-"Transfers" folder with the Collection Runner and see pass/fail per step.
-Note the Collection Runner executes requests sequentially — it's useful for
-functional checks like the ones above, but it does **not** exercise true
-concurrency; for the concurrent get-or-create / retry-storm / conservation
-invariants, use `scripts/burst_test.py`, which fires real parallel requests.
-
-To start a fresh idempotency demo, clear the `idempotency_key` value in the
-environment before re-running step 3 (otherwise it reuses the same key and
-you'll keep seeing a replay).
-
 ## API
 
 All endpoints require `Authorization: Bearer <token>`.
@@ -184,117 +142,72 @@ Each scenario exits non-zero on failure so it can be used as a CI gate.
 
 ## Design write-up
 
-### Conservation + no-overdraft: the simplest correct mechanism
+### Handling transfers safely
 
-Each transfer runs in a **single Postgres transaction**:
+Each transfer is handled inside a **single Postgres transaction**.
 
-1. Lock both wallet rows with two `SELECT ... WHERE id = :id FOR UPDATE`
-   calls, issued in **ascending wallet-id order**, regardless of which one
-   is the sender.
-2. Insert the transfer row (`status='processing'`) — this is also the
-   idempotency check, see below. This must happen **after** the wallet
-   locks, not before: inserting a row with `from_wallet_id`/`to_wallet_id`
-   foreign keys makes Postgres implicitly take a share lock on both
-   referenced wallet rows, in column order rather than sorted order. Doing
-   our own stronger, sorted lock first means that implicit FK lock is
-   already held by our own transaction and never has to wait on it.
-3. In application code, compare the locked `from` balance against the
-   amount. If insufficient, mark the transfer `declined` and commit — no
-   balance is touched. Otherwise debit `from`, credit `to`, mark
-   `completed`, commit.
+The flow is:
 
-Why this is the simplest correct thing:
+1. Lock both wallet rows using `SELECT ... FOR UPDATE`.
 
-- Row locks under the default `READ COMMITTED` isolation are enough,
-  because the only invariant that matters (`balance >= 0` and
-  `debit == credit`) is checked and enforced while holding an exclusive
-  lock on exactly the two rows involved. No wider read-set is needed, so
-  there's nothing to gain from `SERIALIZABLE`.
-- **Deadlock avoidance**: the two lock-acquiring `SELECT ... FOR UPDATE`
-  calls are always issued in ascending wallet-`id` order, not by
-  sender/receiver role, and always *before* the transfer row is inserted
-  (so the insert's implicit foreign-key lock on the wallet rows is already
-  covered by our own lock). So a transfer A→B and a concurrent transfer
-  B→A both try to lock the *lower* id first, then the *higher* id — locks
-  are always acquired in the same global order, which makes a circular
-  wait (and hence a deadlock) impossible. Verified this the hard way with
-  the burst script: a first version that locked the wallets *after*
-  inserting the transfer row still deadlocked, because the FK check inside
-  the `INSERT` itself grabs share locks on both wallets in column order,
-  independent of any sorting done afterwards. A `balance_paise >= 0`
-  `CHECK` constraint is also kept as a defense-in-depth backstop in case
-  application logic ever has a bug.
-- Rejected alternatives:
-  - **`SERIALIZABLE` isolation for the whole transaction** — gives the
-    same correctness but converts contention into transaction *aborts*
-    (`40001` serialization failures) that the client must detect and
-    retry, instead of a plain wait. Under "many concurrent transfers over
-    a small set of wallets" (exactly the grading scenario) this means a
-    non-trivial abort rate and added retry-loop complexity for no extra
-    safety, since explicit row locks already give us exact mutual
-    exclusion on the only rows that matter.
-  - **Optimistic concurrency (version column + retry loop)** — works, but
-    turns high contention on a hot wallet into wasted retries and
-    starvation risk; pessimistic locks are simpler here because the
-    critical section (a couple of `UPDATE`s) is short.
-  - **A single-writer queue/actor per wallet** — would also work but adds
-    infrastructure (a durable queue, sharding by wallet) that a single
-    Postgres instance's row locks already give us for free at this scale.
+   The wallets are always locked in **ascending wallet ID order**, regardless of which wallet is sending the money.
 
-### Where idempotency lives
+2. Insert the transfer with `status = 'processing'`.
 
-The uniqueness constraint is `UNIQUE (from_wallet_id, idempotency_key)` on
-the `transfers` table (scoped to the sender, so unrelated callers can't
-collide on the same key string). The `INSERT ... ON CONFLICT DO NOTHING`
-that claims this key happens in the **same transaction** that later
-performs the debit/credit and sets the final `status` — so the whole thing
-commits or rolls back atomically; idempotency bookkeeping is never split
-from the money movement.
+   This insert also handles idempotency, so it happens in the same transaction as the balance update.
 
-Concurrency falls out of Postgres's own locking: if two requests race on
-the same `(from_wallet_id, idempotency_key)`, the second `INSERT` blocks on
-the first's uncommitted row until it commits or rolls back, then re-checks
-for a conflict — so the loser always observes the *final*, committed
-outcome, never a half-applied one.
+   It is important that we lock the wallets **before** inserting the transfer. The foreign keys on `from_wallet_id` and `to_wallet_id` cause Postgres to take locks on those wallet rows during the insert. By locking the wallets ourselves first, and doing it in a fixed order, we avoid lock-order problems.
 
-On replay, we compare a SHA-256 hash of the semantically relevant fields
-(`from`, `to`, `amount_paise`) against the stored hash from the original
-request:
+3. Check the sender's balance.
 
-- same hash → **idempotent replay**: return the original transfer
-  unchanged (`200` + `Idempotent-Replay: true`).
-- different hash → **`409 Conflict`**: the key was reused for a different
-  request, no new debit/credit is attempted.
+   * If the balance is too low, mark the transfer as `declined` and commit. The balances are not changed.
+   * If there is enough money, debit the sender, credit the receiver, mark the transfer as `completed`, and commit.
 
-### Consistency vs. availability
+This is enough to prevent overdrafts because the balance check and balance update happen while both wallet rows are locked.
 
-For a money workload we chose **consistency (CP)**: a single Postgres
-primary is the one source of truth for every wallet; every read and write
-goes through it with real row-level locking. If that instance (or its
-region) is unreachable, the API is **unavailable** rather than risking a
-stale balance or a write that could conflict with another once connectivity
-returns. We consciously gave up multi-region write availability and
-horizontal write scaling — all transfers funnel through one database — and
-accepted that as the right trade-off for correctness of money movement over
-uptime under partition.
+We don't need `SERIALIZABLE` isolation here. `READ COMMITTED` with the two row locks is enough because every transfer only needs to protect the two wallets involved.
 
-## Observability
+### Avoiding deadlocks
 
-- **Logs**: structured JSON, one line per event, each tagged with a
-  per-request `correlation_id` (from the incoming `X-Request-ID` header, or
-  generated). Domain events logged: `wallet_created`, `transfer_created`,
-  `wallet_debited`, `wallet_credited`, `transfer_completed`,
-  `transfer_declined`, `idempotent_replay_hit`, `idempotency_conflict`, plus
-  one `http_request` line per request with method/path/status/duration.
-  Since the app logs to stdout, any host (Docker, Render, Railway, …) makes
-  these viewable via its standard log stream/dashboard.
-- **Metrics** (`/metrics`, Prometheus text format):
-  - `http_requests_total{method,path,status}` — request rate / error rate.
-  - `http_request_duration_seconds` (histogram) — compute p99 with
-    `histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))`.
-  - Domain counters: `wallets_created_total`, `transfers_created_total`,
-    `transfers_declined_insufficient_funds_total`,
-    `idempotent_replays_total`, `idempotency_conflicts_total`.
+The important part is that wallets are always locked in the same order.
+
+For example, if one request transfers from wallet 10 to wallet 20, while another transfers from wallet 20 to wallet 10, both requests will try to lock wallet 10 first and wallet 20 second.
+
+This prevents them from getting stuck waiting for each other.
+
+The wallet locks also happen **before** the transfer row is inserted. This matters because the foreign-key checks during the insert can also lock the referenced wallet rows.
+
+I initially had the locks after the transfer insert, and the burst test showed that this could deadlock. Moving the wallet locks before the insert fixed that.
+
+There is also a `CHECK (balance_paise >= 0)` constraint on the wallet table as an extra safety net. The application should prevent negative balances, but the database constraint protects us if there is ever a bug in the application code.
+
+### Idempotency
+
+Idempotency is handled by a unique constraint on:
+
+`(from_wallet_id, idempotency_key)`
+
+This means the same idempotency key can be reused by different wallets, but not twice by the same sender.
+
+The transfer row is inserted with:
+
+`INSERT ... ON CONFLICT DO NOTHING`
+
+This happens inside the **same transaction** as the balance changes. So the idempotency check and the actual money movement either both succeed or both roll back.
+
+If two requests arrive at the same time with the same idempotency key, Postgres handles the race for us. The second insert waits for the first transaction to finish and then checks for the conflict again.
+
+That means the second request sees the final result of the first request, rather than a partially completed transfer.
+
+For a retry, we also compare a SHA-256 hash of the important request fields:
+
+`from`, `to`, and `amount_paise`
+
+There are two cases:
+
+* **Same hash:** This is a retry of the original request. Return the existing transfer with `200` and `Idempotent-Replay: true`.
+* **Different hash:** The same idempotency key was used for a different transfer. Return `409 Conflict` and don't move any money.
+
 
 ## Deploying (Render + free managed Postgres)
 
@@ -302,23 +215,17 @@ uptime under partition.
 web service wired together via `DATABASE_URL`.
 
 1. Push this repo to GitHub.
-2. In Render, **New → Blueprint**, point it at the repo (it will read
+2. In Render, **New -> Blueprint**, point it at the repo (it will read
    `render.yaml` and provision both the database and the web service).
-3. Once deployed, Render gives you a public URL — that's what you point
-   `scripts/burst_test.py --base-url` at.
+3. Once deployed, Render gives you a public URL
 
-The same `Dockerfile` works unmodified on Railway, Fly.io, or Koyeb; just
-provide a managed Postgres connection string as `DATABASE_URL` (the app
-accepts both `postgres://` and `postgresql://` URLs).
-
-## What's out of scope / notes
-
-- No migration framework: the schema is small and stable, so
-  `metadata.create_all()` (idempotent `CREATE TABLE IF NOT EXISTS`-style DDL)
-  runs on startup instead of a heavier migration tool.
-- No separate `users` table / signup flow: the bearer token itself is the
-  user identity (hashed before storage), per "a simple bearer token per
-  user identifies the caller."
-- `initial_balance_paise` on `POST /wallets` is a pragmatic addition to fund
-  wallets for demonstration purposes, since the minimum API defines no
-  deposit/mint endpoint.
+## Testing using Render URL
+1. Wallet card: Initial balance 10000 -> click Get / Create Wallet (this is Alice's wallet). Click Use as From.
+2. Change Bearer token to bob -> Get / Create Wallet with balance 0 (Bob's wallet). Click Use as To.
+3. Switch Bearer token back to alice (Basically, before hitting transfer amount, bearer token must be set to user who has been marked as 'Use as From')
+4. Create transfer card: From/To are already filled. Amount 5000, click Generate for idempotency key, click Submit Transfer -> expect status: completed. The transfer id auto-fills into the Transfer status card.
+5. Transfer status card: click Get Transfer Status to confirm completed.
+6. Click Generate next to "Reversal idempotency key", then click Reverse Transfer -> expect a new transfer with status: completed and reversal_of pointing back at the original id.
+7. Check balances: switch token to alice, paste Alice's wallet id, Check Balance -> should be back to 10000. Switch to bob, check his wallet -> should be 0.
+8. Click Reverse Transfer again with the same key -> same result replayed (200, Idempotent-Replay behavior — same reversal id, no change).
+9. Click Generate for a new reversal key and click Reverse Transfer again -> expect an error response with 409 ("transfer has already been reversed") shown in the Activity log.

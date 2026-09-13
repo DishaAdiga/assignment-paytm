@@ -36,10 +36,6 @@ configure_logging()
 
 app = FastAPI(title="Wallet Service")
 
-# Open CORS so the bundled test UI (or Postman) can call a deployed URL from
-# any origin. There's no cookie/session auth to protect against CSRF here -
-# every request must carry an explicit bearer token - so this is safe for a
-# demo/testing service.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

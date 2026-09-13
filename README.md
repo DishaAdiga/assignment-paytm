@@ -219,7 +219,7 @@ web service wired together via `DATABASE_URL`.
    `render.yaml` and provision both the database and the web service).
 3. Once deployed, Render gives you a public URL
 
-## Testing using Render URL
+## Testing using Render URL - https://wallet-service-yu75.onrender.com/ui/
 1. Wallet card: Initial balance 10000 -> click Get / Create Wallet (this is Alice's wallet). Click Use as From.
 2. Change Bearer token to bob -> Get / Create Wallet with balance 0 (Bob's wallet). Click Use as To.
 3. Switch Bearer token back to alice (Basically, before hitting transfer amount, bearer token must be set to user who has been marked as 'Use as From')
